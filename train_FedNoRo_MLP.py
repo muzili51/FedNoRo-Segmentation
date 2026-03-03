@@ -225,52 +225,204 @@ def save_sample_predictions(model, dataloader, device, save_dir, num_samples=20)
                 if img_idx >= num_samples - 1:
                     return
 
+def calculate_confidence_mask(logits_a, logits_b):
+    prob_a = F.softmax(logits_a, dim=1)
+    prob_b = F.softmax(logits_b, dim=1)
+    
+    # 获取最大预测概率作为置信度
+    conf_a, _ = torch.max(prob_a, dim=1, keepdim=True) # [B, 1, H, W]
+    conf_b, _ = torch.max(prob_b, dim=1, keepdim=True) # [B, 1, H, W]
+    
+    # 创建掩码: 当 b 的置信度 > a 的置信度时为 True
+    learn_from_b_mask = (conf_b > conf_a).float() # [B, 1, H, W]
+    return learn_from_b_mask
 
-def dual_network_train_local(client, epochs=5, learning_rate=0.001):
+def calculate_reliability_weight(features, pseudo_labels, num_classes, epsilon=1e-8):
     """
-    双网络客户端的本地训练函数
+    计算可靠性权重 (HR in the paper) 基于类内特征相似性.
+    Args:
+        features: [B, C, H, W] 特征图
+        pseudo_labels: [B, H, W] 伪标签
+        num_classes: 类别数
+    Returns:
+        reliability_weight: [B, 1, H, W] 可靠性权重
     """
-    client.model1.to(client.device)
-    client.model2.to(client.device)
-    client.model1.train()
-    client.model2.train()
+    B, C, H, W = features.shape
+    reliability_maps = []
 
-    criterion = nn.CrossEntropyLoss()
+    for b in range(B):
+        feat = features[b] # [C, H, W]
+        label = pseudo_labels[b] # [H, W]
+        
+        # 初始化原型列表
+        prototypes = []
+        valid_classes = []
+        
+        # 计算每个类别的原型 (平均特征向量)
+        for cls in range(num_classes):
+            mask = (label == cls) # [H, W]
+            if mask.sum() > 0:
+                # 提取该类别的所有特征
+                cls_features = feat[:, mask] # [C, N]
+                prototype = cls_features.mean(dim=1) # [C]
+                prototypes.append(prototype)
+                valid_classes.append(cls)
+            else:
+                # 如果该batch中没有此类别，用零向量或全局均值代替（这里用零）
+                prototypes.append(torch.zeros(C, device=features.device))
+                # 注意：在实际应用中，可能需要更复杂的处理，如使用历史原型
+        
+        prototypes = torch.stack(prototypes, dim=0) # [num_classes, C]
+        
+        # 计算每个像素与所有类别原型的余弦相似度
+        # feat_flat: [C, H*W]
+        feat_flat = feat.view(C, -1).permute(1, 0) # [H*W, C]
+        # prototypes: [num_classes, C]
+        # sim_matrix: [H*W, num_classes]
+        sim_matrix = F.cosine_similarity(feat_flat.unsqueeze(1), prototypes.unsqueeze(0), dim=2) # [H*W, num_classes]
+        sim_matrix = sim_matrix.view(H, W, num_classes).permute(2, 0, 1) # [num_classes, H, W]
+        
+        # 获取伪标签对应的相似度
+        # pseudo_labels_flat: [H*W]
+        pseudo_labels_flat = label.view(-1) # [H*W]
+        # gather_sim: [H*W]
+        gather_sim = sim_matrix.permute(1, 2, 0).view(-1, num_classes)[torch.arange(H*W), pseudo_labels_flat]
+        # gather_sim: [H, W]
+        gather_sim = gather_sim.view(H, W)
+        
+        # 临时方案：可靠性与相似度正相关
+        reliability_map = gather_prototype_sim = gather_sim
+        reliability_maps.append(reliability_map.unsqueeze(0)) # [1, H, W]
+
+    reliability_weight = torch.stack(reliability_maps, dim=0) # [B, 1, H, W]
+    return reliability_weight
+
+
+
+
+def dual_network_train_local(client, epochs=5, learning_rate=0.001, gamma=0.5):
+    device = client.device
+    model1 = client.model1
+    model2 = client.model2
+    train_loader = client.train_loader
+    n_classes = model1.n_classes
+
+    model1.to(device)
+    model2.to(device)
+    model1.train()
+    model2.train()
+
+    criterion_sup = nn.CrossEntropyLoss(reduction='none')  # pixel-wise loss
     optimizer = torch.optim.Adam(
-        list(client.model1.parameters()) + list(client.model2.parameters()), 
+        list(model1.parameters()) + list(model2.parameters()),
         lr=learning_rate
     )
 
     running_loss = 0.0
+    total_batches = 0
+
     for epoch in range(epochs):
-        for batch_idx, (images, masks) in enumerate(client.train_loader):
-            images = images.to(client.device)
-            masks = masks.to(client.device)
+        for batch_idx, (images, noisy_masks) in enumerate(train_loader):
+            images = images.to(device)
+            noisy_masks = noisy_masks.to(device)  # [B, H, W], 可能包含噪声
+            B, H, W = noisy_masks.shape
 
             optimizer.zero_grad()
-            
-            # 获取两个网络的输出
-            output1 = client.model1(images)
-            output2 = client.model2(images)
-            
-            # 确保标签值在有效范围内
-            if masks.min() < 0 or masks.max() >= client.model1.n_classes:
-                masks = torch.clamp(masks, 0, client.model1.n_classes - 1)
-            
-            # 计算两个网络的损失
-            loss1 = criterion(output1, masks)
-            loss2 = criterion(output2, masks)
-            
-            # 总损失
-            loss = loss1 + loss2
-            
-            loss.backward()
+
+            # === 前向传播 ===
+            logits1 = model1(images)  # [B, C, H, W]
+            logits2 = model2(images)
+
+            # === 1. 监督损失（使用原始噪声标签）===
+            # 但我们会用置信度掩码来 down-weight 可疑区域
+            sup_loss1 = criterion_sup(logits1, noisy_masks)  # [B, H, W]
+            sup_loss2 = criterion_sup(logits2, noisy_masks)
+
+            # === 2. 生成伪标签（来自对方网络）===
+            with torch.no_grad():
+                pseudo_labels1 = torch.argmax(logits1, dim=1)  # [B, H, W]
+                pseudo_labels2 = torch.argmax(logits2, dim=1)
+
+            # === 3. 置信度掩码：决定是否信任原始标签 ===
+            prob1 = F.softmax(logits1, dim=1)
+            prob2 = F.softmax(logits2, dim=1)
+            conf1, _ = torch.max(prob1, dim=1)  # [B, H, W]
+            conf2, _ = torch.max(prob2, dim=1)
+
+            # 如果模型1对自己预测的置信度低，说明可能标签错了 → 更应相信模型2的伪标签
+            # WR: 当 conf2 > conf1 时，model1 应从 pseudo_labels2 学习
+            learn_from_2_mask = (conf2 > conf1).float().unsqueeze(1)  # [B, 1, H, W]
+            learn_from_1_mask = (conf1 > conf2).float().unsqueeze(1)
+            try:
+                feat1 = model1.get_bottleneck_features(images)  # [B, C, H', W']
+                feat2 = model2.get_bottleneck_features(images)
+                # 上采样到原图尺寸（如果需要）
+                if feat1.shape[-2:] != (H, W):
+                    feat1 = F.interpolate(feat1, size=(H, W), mode='bilinear', align_corners=False)
+                    feat2 = F.interpolate(feat2, size=(H, W), mode='bilinear', align_corners=False)
+                hr_weight1 = compute_hr_weight(feat1, pseudo_labels2, n_classes, device)
+                hr_weight2 = compute_hr_weight(feat2, pseudo_labels1, n_classes, device)
+            except Exception as e:
+                # 如果无法获取特征，暂时用全1权重
+                hr_weight1 = torch.ones(B, 1, H, W, device=device)
+                hr_weight2 = torch.ones(B, 1, H, W, device=device)
+
+            # === 5. 伪标签损失（KL Loss）===
+            log_pred1 = F.log_softmax(logits1, dim=1)
+            pred2 = F.softmax(logits2, dim=1)
+            log_pred2 = F.log_softmax(logits2, dim=1)
+            pred1 = F.softmax(logits1, dim=1)
+
+            kl1 = F.kl_div(log_pred1, pred2, reduction='none').sum(dim=1, keepdim=True)  # [B, 1, H, W]
+            kl2 = F.kl_div(log_pred2, pred1, reduction='none').sum(dim=1, keepdim=True)
+
+            # 应用 WR 和 HR
+            unsup_loss1 = (kl1 * learn_from_2_mask * hr_weight1).mean()
+            unsup_loss2 = (kl2 * learn_from_1_mask * hr_weight2).mean()
+            unsup_loss = 0.5 * (unsup_loss1 + unsup_loss2)
+            total_sup_loss = 0.5 * (sup_loss1.mean() + sup_loss2.mean())
+            total_loss = total_sup_loss + gamma * unsup_loss
+
+            total_loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += total_loss.item()
+            total_batches += 1
 
-    avg_loss = running_loss / len(client.train_loader)
+    avg_loss = running_loss / total_batches if total_batches > 0 else 0.0
     return avg_loss
+
+
+def compute_hr_weight(features, pseudo_labels, num_classes, device, epsilon=1e-8):
+    B, C, H, W = features.shape
+    hr_maps = []
+
+    for b in range(B):
+        feat = features[b]  # [C, H, W]
+        label = pseudo_labels[b]  # [H, W]
+
+        # 计算每个类别的原型（平均特征）
+        prototypes = []
+        for cls in range(num_classes):
+            mask = (label == cls)  # [H, W]
+            if mask.sum() > 0:
+                cls_feat = feat[:, mask]  # [C, N]
+                proto = cls_feat.mean(dim=1)  # [C]
+            else:
+                proto = torch.zeros(C, device=device)
+            prototypes.append(proto)
+        prototypes = torch.stack(prototypes, dim=0)  # [num_classes, C]
+
+        # 计算每个像素与对应类别原型的余弦相似度
+        feat_flat = feat.view(C, -1).permute(1, 0)  # [HW, C]
+        label_flat = label.view(-1)  # [HW]
+        proto_for_pixel = prototypes[label_flat]  # [HW, C]
+
+        cos_sim = F.cosine_similarity(feat_flat, proto_for_pixel, dim=1)  # [HW]
+        hr_map = cos_sim.view(1, H, W)  # [1, H, W]
+        hr_maps.append(hr_map)
+
+    return torch.stack(hr_maps, dim=0)  # [B, 1, H, W]
 
 
 def advanced_federated_training_with_dual_networks(args, server, clients):
@@ -407,8 +559,8 @@ if __name__ == "__main__":
     global_model = get_model(
         model_name=args.model,  # 从options中获取模型名称
     )
-    image_folder = "D:\\Fundus-doFE\\Fundus\\Domain1\\train\\image"
-    mask_folder = "D:\\Fundus-doFE\\Fundus\\Domain1\\train\\mask"
+    image_folder = "D:\\kvasir-seg\\train\\images"
+    mask_folder = "D:\\kvasir-seg\\train\\masks"
 
     # 创建联邦学习数据加载器
     num_clients = args.n_clients
@@ -472,7 +624,7 @@ if __name__ == "__main__":
     print(f"最终全局模型 - 测试Dice: {final_dice:.4f}, 测试IoU: {final_iou:.4f}")
 
     # 保存训练完成的模型
-    model_save_path = f"saved_models/{args.model}_{args.noise_client_ratio}_FedNoRo_round_{args.rounds}.pth"
+    model_save_path = f"saved_models_for_kvasir/{args.model}_{args.noise_client_ratio}_FedNoRo_round_{args.rounds}.pth"
     save_model(trained_global_model, model_save_path, epoch=args.rounds)
     print(f"模型已保存至: {model_save_path}")
 
@@ -480,7 +632,7 @@ if __name__ == "__main__":
     visualize_single_prediction(trained_global_model, test_loader, device, num_samples=4)
 
     print("保存全局模型预测结果...")
-    save_sample_predictions(trained_global_model, test_loader, device, f"fedavg_global_predictions_{args.model}_{args.noise_client_ratio}_{args.rounds}", num_samples=20)  # 修改为20张
+    save_sample_predictions(trained_global_model, test_loader, device, f"kvasir_global_predictions_{args.model}_{args.noise_client_ratio}_{args.rounds}", num_samples=20)  # 修改为20张
 
     # 输出检测结果总结
     print(f"\n检测结果总结:")
